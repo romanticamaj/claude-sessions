@@ -22,7 +22,7 @@
 #>
 
 param(
-    [int]$Count = 20,
+    [ValidateRange(1, 10000)][int]$Count = 20,
     [string]$Filter = "",
     [string]$Search = "",
     [switch]$Resume,
@@ -30,8 +30,8 @@ param(
     [switch]$All,
     [switch]$ShowDebug,
     [switch]$IncludeForks,
-    [int]$Cleanup = 0,
-    [int]$Preview = 0,
+    [ValidateRange(0, 3650)][int]$Cleanup = 0,
+    [ValidateRange(0, 100)][int]$Preview = 0,
     [string]$ResumeArgs = ""
 )
 
@@ -174,23 +174,30 @@ function Parse-SessionJsonl {
             catch { continue }
         }
 
-        # Read tail for last activity, late /rename, and remaining turn count
-        # Use Get-Content -Tail for efficiency (avoids loading entire file)
-        $tailLines = Get-Content $FilePath -Tail 100 -Encoding UTF8 -ErrorAction SilentlyContinue
-
-        # Count remaining user turns via streaming (skip first 200 already counted)
+        # Single streaming pass: count remaining user turns + capture last 100 lines as tail buffer
+        # (Replaces separate Get-Content -Tail + full streaming read)
         $lineNum = 0
+        $tailBuffer = [System.Collections.Generic.List[string]]::new()
         foreach ($line in [System.IO.File]::ReadLines($FilePath)) {
             $lineNum++
             if ($lineNum -le 200) { continue }
             if ($line -match '"type"\s*:\s*"user"') {
                 $result.UserTurns++
             }
+            $tailBuffer.Add($line)
+            if ($tailBuffer.Count -gt 100) { $tailBuffer.RemoveAt(0) }
+        }
+        # For short files (<= 200 lines), tail overlaps with head — this is intentional and benign
+        # (slug/rename detection has proper guards; user turns are not double-counted)
+        if ($tailBuffer.Count -eq 0) {
+            $tailBuffer = [System.Collections.Generic.List[string]]::new(
+                @($headLines | Where-Object { $_ })
+            )
         }
 
         # Scan tail for last activity and late /rename
         $lastUserMsg = $null
-        foreach ($l in $tailLines) {
+        foreach ($l in $tailBuffer) {
             if (-not $l) { continue }
             try {
                 $obj = $l | ConvertFrom-Json -ErrorAction SilentlyContinue
@@ -236,10 +243,10 @@ function Parse-SessionJsonl {
 # -- Full-text search in transcripts -----------------------------------------
 function Search-SessionTranscript {
     param([string]$FilePath, [string]$Query)
-    # Quick regex search across the file
+    # Quick literal string search across the file
     try {
-        $matches = Select-String -Path $FilePath -Pattern $Query -SimpleMatch -ErrorAction SilentlyContinue
-        return ($null -ne $matches -and $matches.Count -gt 0)
+        $searchResults = Select-String -Path $FilePath -Pattern $Query -SimpleMatch -ErrorAction SilentlyContinue
+        return ($null -ne $searchResults -and $searchResults.Count -gt 0)
     }
     catch { return $false }
 }
@@ -259,45 +266,12 @@ function Show-TranscriptPreview {
                 $obj = $l | ConvertFrom-Json -ErrorAction SilentlyContinue
                 if (-not $obj) { continue }
 
-                if ($obj.type -eq "user" -and $obj.message) {
-                    # User messages: extract text content, skip tool_results
-                    $content = ""
-                    if ($obj.message.content -is [string]) {
-                        $content = $obj.message.content
-                    }
-                    elseif ($obj.message.content -is [System.Array]) {
-                        foreach ($block in $obj.message.content) {
-                            if ($block.type -eq "text" -and $block.text) {
-                                $content = $block.text
-                                break
-                            }
-                        }
-                    }
+                if (($obj.type -eq "user" -or $obj.type -eq "assistant") -and $obj.message) {
+                    $content = Extract-MessageContent $obj.message
                     if ($content.Length -gt 0) {
                         $cleaned = Clean-MessageText $content 120
                         if ($cleaned.Length -gt 0) {
-                            $exchanges.Add(@{ Role = "user"; Text = $cleaned })
-                        }
-                    }
-                }
-                elseif ($obj.type -eq "assistant" -and $obj.message) {
-                    # Assistant messages: extract text blocks (skip thinking/tool_use)
-                    $content = ""
-                    if ($obj.message.content -is [string]) {
-                        $content = $obj.message.content
-                    }
-                    elseif ($obj.message.content -is [System.Array]) {
-                        foreach ($block in $obj.message.content) {
-                            if ($block.type -eq "text" -and $block.text) {
-                                $content = $block.text
-                                break
-                            }
-                        }
-                    }
-                    if ($content.Length -gt 0) {
-                        $cleaned = Clean-MessageText $content 120
-                        if ($cleaned.Length -gt 0) {
-                            $exchanges.Add(@{ Role = "assistant"; Text = $cleaned })
+                            $exchanges.Add(@{ Role = $obj.type; Text = $cleaned })
                         }
                     }
                 }
@@ -361,9 +335,6 @@ foreach ($projDir in $projectDirs) {
         # /rename overrides slug
         $sessionName = if ($parsed.Name) { $parsed.Name } elseif ($parsed.Slug) { $parsed.Slug } else { "" }
 
-        # Skip forked sessions by default
-        if ($parsed.ForkedFrom -and -not $IncludeForks) { continue }
-
         # Skip sessions with no content unless -All
         if (-not $summary -and -not $All) { continue }
         if (-not $summary) { $summary = "(empty session)" }
@@ -390,19 +361,25 @@ foreach ($projDir in $projectDirs) {
     }
 }
 
-# -- Full-text search --------------------------------------------------------
-if ($Search) {
-    Write-Host ""
-    Write-Host "  Searching transcripts for: '$Search' ..." -ForegroundColor DarkYellow
-    $sessions = [System.Collections.Generic.List[object]]::new(
-        @($sessions | Where-Object {
-            Search-SessionTranscript $_.FilePath $Search
-        })
-    )
-    Write-Host "  Found $($sessions.Count) matching session(s)." -ForegroundColor DarkYellow
+# -- Build fork lookup from ALL sessions (before filtering forks out) --------
+$forkChildCount = @{}
+foreach ($s in $sessions) {
+    if ($s.ForkedFrom) {
+        if (-not $forkChildCount.ContainsKey($s.ForkedFrom)) {
+            $forkChildCount[$s.ForkedFrom] = 0
+        }
+        $forkChildCount[$s.ForkedFrom]++
+    }
 }
 
-# -- Filter (supports comma-separated multi-keyword OR) ----------------------
+# -- Filter out forked sessions (unless -IncludeForks) -----------------------
+if (-not $IncludeForks) {
+    $sessions = [System.Collections.Generic.List[object]]::new(
+        @($sessions | Where-Object { -not $_.ForkedFrom })
+    )
+}
+
+# -- Filter first (cheap metadata match), then search (expensive file I/O) ---
 if ($Filter) {
     $keywords = $Filter -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -gt 0 }
     $sessions = [System.Collections.Generic.List[object]]::new(
@@ -423,25 +400,25 @@ if ($Filter) {
     )
 }
 
+if ($Search) {
+    Write-Host ""
+    Write-Host "  Searching transcripts for: '$Search' ..." -ForegroundColor DarkYellow
+    $sessions = [System.Collections.Generic.List[object]]::new(
+        @($sessions | Where-Object {
+            Search-SessionTranscript $_.FilePath $Search
+        })
+    )
+    Write-Host "  Found $($sessions.Count) matching session(s)." -ForegroundColor DarkYellow
+}
+
 # -- Sort & limit (Cleanup overrides Count to scan all) ----------------------
-if ($Cleanup -gt 0) { $Count = [int]::MaxValue }
+if ($Cleanup -gt 0) { $Count = 10000 }
 $sorted = $sessions | Sort-Object LastModified -Descending | Select-Object -First $Count
 $sessions = [System.Collections.Generic.List[object]]::new(@($sorted))
 
 if ($sessions.Count -eq 0) {
     Write-Host "No sessions found." -ForegroundColor Yellow
     exit 0
-}
-
-# -- Build fork lookup for display -------------------------------------------
-$forkChildCount = @{}
-foreach ($s in $sessions) {
-    if ($s.ForkedFrom) {
-        if (-not $forkChildCount.ContainsKey($s.ForkedFrom)) {
-            $forkChildCount[$s.ForkedFrom] = 0
-        }
-        $forkChildCount[$s.ForkedFrom]++
-    }
 }
 
 # -- Cleanup mode -------------------------------------------------------------

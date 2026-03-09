@@ -159,8 +159,8 @@ If you are an AI agent installing this tool for a user on Windows, follow these 
 
 1. Scans `~/.claude/projects/` for `.jsonl` session files
 2. Parses the first 200 lines for: working directory, session slug, first user prompt, fork relationships
-3. Streams through the file to count user turns efficiently (without loading the full file into memory)
-4. Reads the last 100 lines via `Get-Content -Tail` for: last user message, late `/rename` commands
+3. Single streaming pass counts remaining user turns and captures the last 100 lines in a circular buffer (no full file load into memory)
+4. Scans captured tail for: last user message, late `/rename` commands
 5. Detects fork relationships via `forkedFrom.sessionId` references
 6. Decodes Claude's folder naming convention (e.g., `D--myproject` -> `D:\myproject`)
 7. Displays a formatted, color-coded table sorted by last modified time
