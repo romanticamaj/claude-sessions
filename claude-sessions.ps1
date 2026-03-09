@@ -15,17 +15,23 @@
       .\claude-sessions.ps1 -Continue    # Resume most recent session immediately
       .\claude-sessions.ps1 -All         # Include empty/aborted sessions
       .\claude-sessions.ps1 -Cleanup 30  # Delete sessions older than 30 days
+      .\claude-sessions.ps1 -Search "error handling"  # Full-text search in transcripts
+      .\claude-sessions.ps1 -Preview 5   # Show last 5 exchanges when resuming
+      .\claude-sessions.ps1 -IncludeForks  # Show forked sessions
       .\claude-sessions.ps1 -Resume -ResumeArgs "--model opus"  # Pass extra flags to claude
 #>
 
 param(
     [int]$Count = 20,
     [string]$Filter = "",
+    [string]$Search = "",
     [switch]$Resume,
     [switch]$Continue,
     [switch]$All,
     [switch]$ShowDebug,
+    [switch]$IncludeForks,
     [int]$Cleanup = 0,
+    [int]$Preview = 0,
     [string]$ResumeArgs = ""
 )
 
@@ -61,7 +67,7 @@ function Clean-MessageText {
     param([string]$Text, [int]$MaxLen = 80)
     $cleaned = $Text -replace '<[^>]+>', '' -replace '[\r\n]+', ' ' -replace '\s+', ' '
     $cleaned = $cleaned.Trim()
-    if ($cleaned.Length -gt $MaxLen) {
+    if ($MaxLen -gt 0 -and $cleaned.Length -gt $MaxLen) {
         $cleaned = $cleaned.Substring(0, $MaxLen - 1) + [char]0x2026
     }
     return $cleaned
@@ -69,8 +75,6 @@ function Clean-MessageText {
 
 function Decode-FolderName {
     param([string]$FolderName)
-    # Claude encodes paths: D--ulovemusic => D:\ulovemusic, C--Users-foo-bar => C:\Users\foo\bar
-    # Pattern: first segment before -- is drive letter, rest uses - as path separator
     if ($FolderName -match '^([A-Za-z])--(.+)$') {
         $drive = $Matches[1].ToUpper()
         $rest = $Matches[2] -replace '-', '\'
@@ -79,18 +83,52 @@ function Decode-FolderName {
     return $FolderName
 }
 
-# -- Parse a .jsonl: extract cwd, slug, first/last user message, /rename, stats --
+function Format-FileSize {
+    param([long]$Bytes)
+    if ($Bytes -lt 1KB) { return "${Bytes}B" }
+    if ($Bytes -lt 1MB) { return "$([Math]::Round($Bytes / 1KB, 0))K" }
+    if ($Bytes -lt 1GB) { return "$([Math]::Round($Bytes / 1MB, 1))M" }
+    return "$([Math]::Round($Bytes / 1GB, 1))G"
+}
+
+function Format-RelativeTime {
+    param([DateTime]$Time)
+    $diff = (Get-Date) - $Time
+    if ($diff.TotalMinutes -lt 1)  { return "just now" }
+    if ($diff.TotalMinutes -lt 60) { return "$([int]$diff.TotalMinutes)m ago" }
+    if ($diff.TotalHours -lt 24)   { return "$([int]$diff.TotalHours)h ago" }
+    if ($diff.TotalDays -lt 30)    { return "$([int]$diff.TotalDays)d ago" }
+    return $Time.ToString("yyyy-MM-dd")
+}
+
+function Shorten-Path {
+    param([string]$FullPath, [int]$MaxLen = 25)
+    $short = $FullPath -replace [regex]::Escape($env:USERPROFILE), '~'
+    if ($short.Length -gt $MaxLen) {
+        $parts = $short -split '[\\\/]'
+        if ($parts.Count -gt 3) {
+            $short = "$($parts[0])\...\$($parts[-2])\$($parts[-1])"
+        }
+        if ($short.Length -gt $MaxLen) {
+            $short = ".." + $short.Substring($short.Length - $MaxLen + 2)
+        }
+    }
+    return $short
+}
+
+# -- Parse a .jsonl: extract cwd, slug, first/last user message, /rename, stats, fork --
 function Parse-SessionJsonl {
     param([string]$FilePath)
 
     $result = @{
         Cwd = $null; Summary = $null; LastActivity = $null
         Name = $null; Slug = $null; UserTurns = 0
+        ForkedFrom = $null
     }
     if (-not (Test-Path $FilePath)) { return $result }
 
     try {
-        # Read head (first 200 lines) for cwd, slug, first prompt
+        # Read head (first 200 lines) for cwd, slug, first prompt, fork info
         $headLines = Get-Content $FilePath -TotalCount 200 -Encoding UTF8 -ErrorAction SilentlyContinue
         foreach ($line in $headLines) {
             if (-not $line) { continue }
@@ -100,6 +138,11 @@ function Parse-SessionJsonl {
 
                 if (-not $result.Slug -and $obj.slug) {
                     $result.Slug = $obj.slug
+                }
+
+                # Detect fork relationship
+                if (-not $result.ForkedFrom -and $obj.forkedFrom -and $obj.forkedFrom.sessionId) {
+                    $result.ForkedFrom = $obj.forkedFrom.sessionId
                 }
 
                 if ($obj.type -eq "user" -and $obj.message) {
@@ -127,34 +170,27 @@ function Parse-SessionJsonl {
                         }
                     }
                 }
-
-                if ($result.Cwd -and $result.Summary -and ($result.Slug -or $result.Name)) { break }
             }
             catch { continue }
         }
 
-        # Read tail (last 100 lines) for last activity, late /rename, and remaining turn count
-        $allLines = Get-Content $FilePath -Encoding UTF8 -ErrorAction SilentlyContinue
-        $totalLines = $allLines.Count
-        $tailStart = [Math]::Max(0, $totalLines - 100)
+        # Read tail for last activity, late /rename, and remaining turn count
+        # Use Get-Content -Tail for efficiency (avoids loading entire file)
+        $tailLines = Get-Content $FilePath -Tail 100 -Encoding UTF8 -ErrorAction SilentlyContinue
 
-        # If file is longer than head, count user turns in the middle + tail
-        if ($totalLines -gt 200) {
-            # Count user turns in lines we haven't scanned yet (200..end)
-            for ($i = 200; $i -lt $totalLines; $i++) {
-                $l = $allLines[$i]
-                if (-not $l) { continue }
-                # Quick check before parsing JSON for performance
-                if ($l -match '"type"\s*:\s*"user"') {
-                    $result.UserTurns++
-                }
+        # Count remaining user turns via streaming (skip first 200 already counted)
+        $lineNum = 0
+        foreach ($line in [System.IO.File]::ReadLines($FilePath)) {
+            $lineNum++
+            if ($lineNum -le 200) { continue }
+            if ($line -match '"type"\s*:\s*"user"') {
+                $result.UserTurns++
             }
         }
 
         # Scan tail for last activity and late /rename
         $lastUserMsg = $null
-        for ($i = $tailStart; $i -lt $totalLines; $i++) {
-            $l = $allLines[$i]
+        foreach ($l in $tailLines) {
             if (-not $l) { continue }
             try {
                 $obj = $l | ConvertFrom-Json -ErrorAction SilentlyContinue
@@ -197,13 +233,103 @@ function Parse-SessionJsonl {
     return $result
 }
 
-# -- Format file size --------------------------------------------------------
-function Format-FileSize {
-    param([long]$Bytes)
-    if ($Bytes -lt 1KB) { return "${Bytes}B" }
-    if ($Bytes -lt 1MB) { return "$([Math]::Round($Bytes / 1KB, 0))K" }
-    if ($Bytes -lt 1GB) { return "$([Math]::Round($Bytes / 1MB, 1))M" }
-    return "$([Math]::Round($Bytes / 1GB, 1))G"
+# -- Full-text search in transcripts -----------------------------------------
+function Search-SessionTranscript {
+    param([string]$FilePath, [string]$Query)
+    # Quick regex search across the file
+    try {
+        $matches = Select-String -Path $FilePath -Pattern $Query -SimpleMatch -ErrorAction SilentlyContinue
+        return ($null -ne $matches -and $matches.Count -gt 0)
+    }
+    catch { return $false }
+}
+
+# -- Show transcript preview -------------------------------------------------
+function Show-TranscriptPreview {
+    param([string]$FilePath, [int]$ExchangeCount = 5)
+
+    $exchanges = [System.Collections.Generic.List[object]]::new()
+
+    try {
+        # Read tail for recent exchanges
+        $tailLines = Get-Content $FilePath -Tail 500 -Encoding UTF8 -ErrorAction SilentlyContinue
+        foreach ($l in $tailLines) {
+            if (-not $l) { continue }
+            try {
+                $obj = $l | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if (-not $obj) { continue }
+
+                if ($obj.type -eq "user" -and $obj.message) {
+                    # User messages: extract text content, skip tool_results
+                    $content = ""
+                    if ($obj.message.content -is [string]) {
+                        $content = $obj.message.content
+                    }
+                    elseif ($obj.message.content -is [System.Array]) {
+                        foreach ($block in $obj.message.content) {
+                            if ($block.type -eq "text" -and $block.text) {
+                                $content = $block.text
+                                break
+                            }
+                        }
+                    }
+                    if ($content.Length -gt 0) {
+                        $cleaned = Clean-MessageText $content 120
+                        if ($cleaned.Length -gt 0) {
+                            $exchanges.Add(@{ Role = "user"; Text = $cleaned })
+                        }
+                    }
+                }
+                elseif ($obj.type -eq "assistant" -and $obj.message) {
+                    # Assistant messages: extract text blocks (skip thinking/tool_use)
+                    $content = ""
+                    if ($obj.message.content -is [string]) {
+                        $content = $obj.message.content
+                    }
+                    elseif ($obj.message.content -is [System.Array]) {
+                        foreach ($block in $obj.message.content) {
+                            if ($block.type -eq "text" -and $block.text) {
+                                $content = $block.text
+                                break
+                            }
+                        }
+                    }
+                    if ($content.Length -gt 0) {
+                        $cleaned = Clean-MessageText $content 120
+                        if ($cleaned.Length -gt 0) {
+                            $exchanges.Add(@{ Role = "assistant"; Text = $cleaned })
+                        }
+                    }
+                }
+            }
+            catch { continue }
+        }
+    }
+    catch {}
+
+    if ($exchanges.Count -eq 0) {
+        Write-Host "    (no transcript available)" -ForegroundColor DarkGray
+        return
+    }
+
+    # Show last N exchanges
+    $startIdx = [Math]::Max(0, $exchanges.Count - ($ExchangeCount * 2))
+    Write-Host ""
+    Write-Host "    Transcript (last $ExchangeCount exchanges):" -ForegroundColor DarkGray
+    Write-Host ("    " + ("-" * 80)) -ForegroundColor DarkGray
+
+    for ($i = $startIdx; $i -lt $exchanges.Count; $i++) {
+        $ex = $exchanges[$i]
+        if ($ex.Role -eq "user") {
+            Write-Host "    You: " -NoNewline -ForegroundColor Cyan
+            Write-Host $ex.Text -ForegroundColor White
+        }
+        else {
+            Write-Host "    AI:  " -NoNewline -ForegroundColor DarkYellow
+            Write-Host $ex.Text -ForegroundColor Gray
+        }
+    }
+    Write-Host ("    " + ("-" * 80)) -ForegroundColor DarkGray
 }
 
 # -- Collect sessions ---------------------------------------------------------
@@ -235,6 +361,9 @@ foreach ($projDir in $projectDirs) {
         # /rename overrides slug
         $sessionName = if ($parsed.Name) { $parsed.Name } elseif ($parsed.Slug) { $parsed.Slug } else { "" }
 
+        # Skip forked sessions by default
+        if ($parsed.ForkedFrom -and -not $IncludeForks) { continue }
+
         # Skip sessions with no content unless -All
         if (-not $summary -and -not $All) { continue }
         if (-not $summary) { $summary = "(empty session)" }
@@ -249,13 +378,28 @@ foreach ($projDir in $projectDirs) {
             FileSize     = $jsonl.Length
             LastModified = $jsonl.LastWriteTime
             FilePath     = $jsonl.FullName
+            ForkedFrom   = $parsed.ForkedFrom
+            IsRenamed    = ($null -ne $parsed.Name -and $parsed.Name.Length -gt 0)
         })
 
         if ($ShowDebug) {
             $nameTag = if ($sessionName) { " [$sessionName]" } else { "" }
-            Write-Host "  [DBG]   $id$nameTag | $projectPath | $summary" -ForegroundColor DarkGray
+            $forkTag = if ($parsed.ForkedFrom) { " (fork)" } else { "" }
+            Write-Host "  [DBG]   $id$nameTag$forkTag | $projectPath | $summary" -ForegroundColor DarkGray
         }
     }
+}
+
+# -- Full-text search --------------------------------------------------------
+if ($Search) {
+    Write-Host ""
+    Write-Host "  Searching transcripts for: '$Search' ..." -ForegroundColor DarkYellow
+    $sessions = [System.Collections.Generic.List[object]]::new(
+        @($sessions | Where-Object {
+            Search-SessionTranscript $_.FilePath $Search
+        })
+    )
+    Write-Host "  Found $($sessions.Count) matching session(s)." -ForegroundColor DarkYellow
 }
 
 # -- Filter (supports comma-separated multi-keyword OR) ----------------------
@@ -279,7 +423,8 @@ if ($Filter) {
     )
 }
 
-# -- Sort & limit ------------------------------------------------------------
+# -- Sort & limit (Cleanup overrides Count to scan all) ----------------------
+if ($Cleanup -gt 0) { $Count = [int]::MaxValue }
 $sorted = $sessions | Sort-Object LastModified -Descending | Select-Object -First $Count
 $sessions = [System.Collections.Generic.List[object]]::new(@($sorted))
 
@@ -288,30 +433,15 @@ if ($sessions.Count -eq 0) {
     exit 0
 }
 
-# -- Display helpers (defined early so Cleanup can use Shorten-Path) ----------
-function Format-RelativeTime {
-    param([DateTime]$Time)
-    $diff = (Get-Date) - $Time
-    if ($diff.TotalMinutes -lt 1)  { return "just now" }
-    if ($diff.TotalMinutes -lt 60) { return "$([int]$diff.TotalMinutes)m ago" }
-    if ($diff.TotalHours -lt 24)   { return "$([int]$diff.TotalHours)h ago" }
-    if ($diff.TotalDays -lt 30)    { return "$([int]$diff.TotalDays)d ago" }
-    return $Time.ToString("yyyy-MM-dd")
-}
-
-function Shorten-Path {
-    param([string]$FullPath, [int]$MaxLen = 25)
-    $short = $FullPath -replace [regex]::Escape($env:USERPROFILE), '~'
-    if ($short.Length -gt $MaxLen) {
-        $parts = $short -split '[\\\/]'
-        if ($parts.Count -gt 3) {
-            $short = "$($parts[0])\...\$($parts[-2])\$($parts[-1])"
+# -- Build fork lookup for display -------------------------------------------
+$forkChildCount = @{}
+foreach ($s in $sessions) {
+    if ($s.ForkedFrom) {
+        if (-not $forkChildCount.ContainsKey($s.ForkedFrom)) {
+            $forkChildCount[$s.ForkedFrom] = 0
         }
-        if ($short.Length -gt $MaxLen) {
-            $short = ".." + $short.Substring($short.Length - $MaxLen + 2)
-        }
+        $forkChildCount[$s.ForkedFrom]++
     }
-    return $short
 }
 
 # -- Cleanup mode -------------------------------------------------------------
@@ -365,10 +495,15 @@ if ($Continue) {
     Write-Host "  Prompt:   $($latest.Summary)" -ForegroundColor White
     Write-Host "  Project:  $($latest.Project)" -ForegroundColor DarkGray
     Write-Host "  ID:       $($latest.SessionId)" -ForegroundColor DarkGray
+
+    if ($Preview -gt 0) {
+        Show-TranscriptPreview $latest.FilePath $Preview
+    }
+
     Write-Host ""
 
     $originalPath = $latest.Project
-    $clArgs = @("--continue", "--resume", $latest.SessionId)
+    $clArgs = @("--resume", $latest.SessionId)
     if ($ResumeArgs) {
         $clArgs += ($ResumeArgs -split '\s+')
     }
@@ -405,17 +540,28 @@ foreach ($s in $sessions) {
     $sizeStr = Format-FileSize $s.FileSize
     $statsStr = "$($s.UserTurns)t $sizeStr"
 
+    # Fork/rename indicators
+    $forkCount = if ($forkChildCount.ContainsKey($s.SessionId)) { $forkChildCount[$s.SessionId] } else { 0 }
+    $indicators = ""
+    if ($s.IsRenamed) { $indicators += [char]0x2605 }  # star for renamed
+    if ($s.ForkedFrom) { $indicators += [char]0x21B3 }  # arrow for fork
+    if ($forkCount -gt 0) { $indicators += " +${forkCount}f" }
+    if ($indicators) { $indicators = " $indicators" }
+
     Write-Host ("  {0,4}) " -f $index) -NoNewline -ForegroundColor DarkGray
     Write-Host ("{0,-9} " -f $timeStr) -NoNewline -ForegroundColor DarkYellow
     Write-Host ("{0,-7} " -f $statsStr) -NoNewline -ForegroundColor DarkCyan
     Write-Host ("{0,-25} " -f $projectStr) -NoNewline -ForegroundColor Green
     if ($s.Name) {
-        Write-Host ("{0,-22} " -f $nameStr) -NoNewline -ForegroundColor Cyan
+        Write-Host ("{0,-22}" -f $nameStr) -NoNewline -ForegroundColor Cyan
     }
     else {
-        Write-Host ("{0,-22} " -f $nameStr) -NoNewline -ForegroundColor DarkGray
+        Write-Host ("{0,-22}" -f $nameStr) -NoNewline -ForegroundColor DarkGray
     }
-    Write-Host $s.Summary -ForegroundColor White
+    if ($indicators) {
+        Write-Host $indicators -NoNewline -ForegroundColor Magenta
+    }
+    Write-Host " $($s.Summary)" -ForegroundColor White
 
     # Show last activity on a second line if available
     if ($s.LastActivity) {
@@ -442,6 +588,14 @@ if ($Resume) {
             Write-Host "  Project:  $($selected.Project)" -ForegroundColor DarkGray
             Write-Host "  ID:       $($selected.SessionId)" -ForegroundColor DarkGray
             Write-Host "  Turns:    $($selected.UserTurns) | Size: $(Format-FileSize $selected.FileSize)" -ForegroundColor DarkGray
+            if ($selected.ForkedFrom) {
+                Write-Host "  Fork of:  $($selected.ForkedFrom.Substring(0, 8))..." -ForegroundColor Magenta
+            }
+
+            if ($Preview -gt 0) {
+                Show-TranscriptPreview $selected.FilePath $Preview
+            }
+
             Write-Host ""
 
             $originalPath = $selected.Project
@@ -468,12 +622,15 @@ if ($Resume) {
 }
 else {
     Write-Host ""
-    Write-Host "  Tip: .\claude-sessions.ps1 -Resume            (pick & resume)" -ForegroundColor DarkGray
-    Write-Host "       .\claude-sessions.ps1 -Continue          (resume most recent)" -ForegroundColor DarkGray
-    Write-Host "       .\claude-sessions.ps1 -Filter X          (search by keyword)" -ForegroundColor DarkGray
-    Write-Host "       .\claude-sessions.ps1 -Filter ""a,b""      (multi-keyword OR)" -ForegroundColor DarkGray
-    Write-Host "       .\claude-sessions.ps1 -All               (include empty sessions)" -ForegroundColor DarkGray
-    Write-Host "       .\claude-sessions.ps1 -Cleanup 30        (delete sessions >30 days)" -ForegroundColor DarkGray
+    Write-Host "  Tip: .\claude-sessions.ps1 -Resume              (pick & resume)" -ForegroundColor DarkGray
+    Write-Host "       .\claude-sessions.ps1 -Continue            (resume most recent)" -ForegroundColor DarkGray
+    Write-Host "       .\claude-sessions.ps1 -Filter X            (search by keyword)" -ForegroundColor DarkGray
+    Write-Host "       .\claude-sessions.ps1 -Filter ""a,b""        (multi-keyword OR)" -ForegroundColor DarkGray
+    Write-Host "       .\claude-sessions.ps1 -Search ""query""       (full-text transcript search)" -ForegroundColor DarkGray
+    Write-Host "       .\claude-sessions.ps1 -All                 (include empty sessions)" -ForegroundColor DarkGray
+    Write-Host "       .\claude-sessions.ps1 -IncludeForks        (show forked sessions)" -ForegroundColor DarkGray
+    Write-Host "       .\claude-sessions.ps1 -Resume -Preview 5   (preview last 5 exchanges)" -ForegroundColor DarkGray
+    Write-Host "       .\claude-sessions.ps1 -Cleanup 30          (delete sessions >30 days)" -ForegroundColor DarkGray
     Write-Host "       .\claude-sessions.ps1 -Resume -ResumeArgs ""--model opus""" -ForegroundColor DarkGray
     Write-Host ""
 }

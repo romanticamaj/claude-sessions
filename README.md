@@ -4,6 +4,8 @@ List, search, and resume [Claude Code](https://docs.anthropic.com/en/docs/claude
 
 Claude Code stores session data in `~/.claude/projects/` as `.jsonl` files, but there's no built-in way to browse them. This script parses those files and gives you a sortable, filterable table with one-click resume.
 
+Inspired by [cc-sessions](https://github.com/chronologos/cc-sessions) (Rust CLI for macOS/Linux) — this is a zero-dependency PowerShell alternative for Windows.
+
 ## Example Output
 
 ```
@@ -13,7 +15,7 @@ Claude Code stores session data in `~/.claude/projects/` as `.jsonl` files, but 
   ----------------------------------------------------------------------------------------------------------------------------------
      1) just now  12t 328K D:\myproject              lucky-inventing-sundae read the config file and suggest improvements
                                                      > implement all of them
-     2) 3h ago    88t 1.4M D:\webapp                 swirling-giggling-wirt Add dark mode to the dashboard
+     2) 3h ago    88t 1.4M D:\webapp                 swirling-giggling-wirt +1f Add dark mode to the dashboard
                                                      > Catch you later!
      3) 1d ago    2t 60K   D:\tools                  misty-drifting-turing  help me install the CLI tool
      4) 2d ago    251t 2.1M D:\myproject              -                     Fix the authentication bug
@@ -26,7 +28,10 @@ Claude Code stores session data in `~/.claude/projects/` as `.jsonl` files, but 
 - `STATS` - user turn count + session file size (e.g., `12t 328K` = 12 user turns, 328KB file)
 - `PROJECT` - working directory (shortened)
 - `SESSION NAME` - session slug or `/rename` name
-- `FIRST PROMPT / LAST ACTIVITY` - first user message, with last activity shown as a gray sub-line when different
+
+**Indicators:**
+- `+Nf` - session has N forked children
+- Renamed sessions (via `/rename`) are tracked and displayed
 
 ## Prerequisites
 
@@ -72,11 +77,20 @@ Then just run `cs` from any terminal.
 # Filter by multiple keywords (OR match)
 .\claude-sessions.ps1 -Filter "auth,login"
 
+# Full-text search inside session transcripts
+.\claude-sessions.ps1 -Search "error handling"
+
 # Include empty/aborted sessions
 .\claude-sessions.ps1 -All
 
+# Show forked sessions (hidden by default)
+.\claude-sessions.ps1 -IncludeForks
+
 # Interactive resume: shows list, pick a number
 .\claude-sessions.ps1 -Resume
+
+# Resume with transcript preview (last 5 exchanges)
+.\claude-sessions.ps1 -Resume -Preview 5
 
 # Auto-resume the most recent session
 .\claude-sessions.ps1 -Continue
@@ -97,12 +111,26 @@ Then just run `cs` from any terminal.
 |-----------|------|---------|-------------|
 | `-Count` | int | 20 | Number of sessions to display |
 | `-Filter` | string | | Keyword filter (comma-separated for OR) |
+| `-Search` | string | | Full-text search inside session transcripts |
 | `-Resume` | switch | | Interactive session picker to resume |
 | `-Continue` | switch | | Auto-resume the most recent session |
+| `-Preview` | int | 0 | Show last N exchanges before resuming |
 | `-All` | switch | | Include empty/aborted sessions |
+| `-IncludeForks` | switch | | Show forked sessions (hidden by default) |
 | `-Cleanup` | int | 0 | Delete sessions older than N days |
 | `-ResumeArgs` | string | | Extra flags to pass to `claude` CLI |
 | `-ShowDebug` | switch | | Show debug/parsing output |
+
+## Features
+
+### Fork Detection
+Sessions created by forking (branching) from an existing session are detected via `forkedFrom.sessionId` in the JSONL data. Forked sessions are hidden by default — use `-IncludeForks` to show them. Parent sessions show `+Nf` indicating how many forks they have.
+
+### Full-Text Transcript Search
+`-Search "query"` scans the full content of every session file to find sessions that mention a specific term. Useful for finding sessions where you discussed a particular topic, even if the first prompt doesn't mention it.
+
+### Transcript Preview
+`-Preview N` shows the last N exchanges (user/assistant messages) before resuming a session, so you can refresh your context without opening the session. Works with both `-Resume` and `-Continue`.
 
 ## Agent Install Instructions
 
@@ -130,11 +158,12 @@ If you are an AI agent installing this tool for a user on Windows, follow these 
 ## How It Works
 
 1. Scans `~/.claude/projects/` for `.jsonl` session files
-2. Parses the first 200 lines for: working directory, session slug, first user prompt
-3. Parses the last 100 lines for: last user message, late `/rename` commands
-4. Counts user turns and measures file size for session stats
-5. Decodes Claude's folder naming convention (e.g., `D--myproject` -> `D:\myproject`)
-6. Displays a formatted, color-coded table sorted by last modified time
+2. Parses the first 200 lines for: working directory, session slug, first user prompt, fork relationships
+3. Streams through the file to count user turns efficiently (without loading the full file into memory)
+4. Reads the last 100 lines via `Get-Content -Tail` for: last user message, late `/rename` commands
+5. Detects fork relationships via `forkedFrom.sessionId` references
+6. Decodes Claude's folder naming convention (e.g., `D--myproject` -> `D:\myproject`)
+7. Displays a formatted, color-coded table sorted by last modified time
 
 ## License
 
